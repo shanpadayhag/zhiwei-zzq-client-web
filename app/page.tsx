@@ -1,19 +1,20 @@
 "use client";
 
 import { useState, useEffect } from "react";
-import { Plus, Pencil, Trash2, Building2, MapPin, BriefcaseBusinessIcon, Calendar, Clock } from "lucide-react";
+import { Plus, Pencil, Trash2, Building2, MapPin, BriefcaseBusinessIcon, Calendar, Clock, ChevronLeft, ChevronRight } from "lucide-react";
 import { Button } from '@/components/ui/button';
 import { Dialog, DialogContent, DialogDescription, DialogHeader, DialogTitle } from '@/components/ui/dialog';
 import { Label } from '@/components/ui/label';
 import { Input } from '@/components/ui/input';
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select';
+import Dexie from 'dexie';
 
 // Types
 type ApplicationStatus = "Applied" | "Interviewing" | "Offer" | "Rejected" | "Withdrawn";
 type CoolOffStartType = "application" | "rejection";
 
 interface JobApplication {
-  id: string;
+  id?: number;
   company: string;
   jobTitle: string;
   location: string;
@@ -23,10 +24,27 @@ interface JobApplication {
   coolOffStartType: CoolOffStartType;
 }
 
+// Database setup
+const db = new Dexie('JobApplicationsDB') as Dexie & {
+  applications: Dexie.Table<JobApplication, number>;
+};
+
+db.version(1).stores({
+  applications: '++id, company, jobTitle, location, status, appliedDate, coolOffEnds, coolOffStartType'
+});
+
 export default function Home() {
   const [applications, setApplications] = useState<JobApplication[]>([]);
+  const [totalCount, setTotalCount] = useState(0);
+  const [currentPage, setCurrentPage] = useState(1);
   const [isDialogOpen, setIsDialogOpen] = useState(false);
-  const [editingId, setEditingId] = useState<string | null>(null);
+  const [editingId, setEditingId] = useState<number | null>(null);
+  const [stats, setStats] = useState({
+    total: 0,
+    interviewing: 0,
+    offers: 0,
+    activeCoolOffs: 0,
+  });
   const [formData, setFormData] = useState({
     company: "",
     jobTitle: "",
@@ -35,18 +53,58 @@ export default function Home() {
     coolOffStartType: "application" as CoolOffStartType,
   });
 
-  // Load from localStorage on mount
-  useEffect(() => {
-    const stored = localStorage.getItem("jobApplications");
-    if (stored) {
-      setApplications(JSON.parse(stored));
-    }
-  }, []);
+  const ITEMS_PER_PAGE = 10;
 
-  // Save to localStorage whenever applications change
+  // Load applications with cursor pagination
+  const loadApplications = async (page: number) => {
+    try {
+      const offset = (page - 1) * ITEMS_PER_PAGE;
+
+      // Get total count
+      const total = await db.applications.count();
+      setTotalCount(total);
+
+      // Get paginated data (sorted by appliedDate descending)
+      const apps = await db.applications
+        .orderBy('appliedDate')
+        .reverse()
+        .offset(offset)
+        .limit(ITEMS_PER_PAGE)
+        .toArray();
+
+      setApplications(apps);
+    } catch (error) {
+      console.error('Error loading applications:', error);
+    }
+  };
+
+  // Load stats
+  const loadStats = async () => {
+    try {
+      const total = await db.applications.count();
+      const interviewing = await db.applications.where('status').equals('Interviewing').count();
+      const offers = await db.applications.where('status').equals('Offer').count();
+
+      // Calculate active cool-offs
+      const allApps = await db.applications.toArray();
+      const activeCoolOffs = allApps.filter(app => getDaysRemaining(app.coolOffEnds) > 0).length;
+
+      setStats({
+        total,
+        interviewing,
+        offers,
+        activeCoolOffs,
+      });
+    } catch (error) {
+      console.error('Error loading stats:', error);
+    }
+  };
+
+  // Initial load
   useEffect(() => {
-    localStorage.setItem("jobApplications", JSON.stringify(applications));
-  }, [applications]);
+    loadApplications(currentPage);
+    loadStats();
+  }, [currentPage]);
 
   const calculateCoolOffDate = (appliedDate: string, startType: CoolOffStartType) => {
     const date = new Date(appliedDate);
@@ -54,47 +112,52 @@ export default function Home() {
     return date.toISOString().split("T")[0];
   };
 
-  const handleSubmit = (e: React.FormEvent) => {
+  const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
 
-    // Check for duplicate (same company, job title, and location)
-    const isDuplicate = applications.some(
-      (app) =>
-        app.company.toLowerCase() === formData.company.toLowerCase() &&
-        app.jobTitle.toLowerCase() === formData.jobTitle.toLowerCase() &&
-        app.location.toLowerCase() === formData.location.toLowerCase() &&
-        app.id !== editingId
-    );
-
-    if (isDuplicate) {
-      alert("This application already exists! You cannot apply to the same company, role, and location.");
-      return;
-    }
-
-    const appliedDate = new Date().toISOString().split("T")[0];
-    const coolOffEnds = calculateCoolOffDate(appliedDate, formData.coolOffStartType);
-
-    if (editingId) {
-      // Update existing
-      setApplications(
-        applications.map((app) =>
-          app.id === editingId
-            ? { ...app, ...formData }
-            : app
+    try {
+      // Check for duplicate (same company, job title, and location)
+      const existingApp = await db.applications
+        .where('company').equalsIgnoreCase(formData.company)
+        .and(app =>
+          app.jobTitle.toLowerCase() === formData.jobTitle.toLowerCase() &&
+          app.location.toLowerCase() === formData.location.toLowerCase() &&
+          app.id !== editingId
         )
-      );
-    } else {
-      // Create new
-      const newApp: JobApplication = {
-        id: Date.now().toString(),
-        ...formData,
-        appliedDate,
-        coolOffEnds,
-      };
-      setApplications([...applications, newApp]);
-    }
+        .first();
 
-    resetForm();
+      if (existingApp) {
+        alert("This application already exists! You cannot apply to the same company, role, and location.");
+        return;
+      }
+
+      const appliedDate = new Date().toISOString().split("T")[0];
+      const coolOffEnds = calculateCoolOffDate(appliedDate, formData.coolOffStartType);
+
+      if (editingId) {
+        // Update existing
+        await db.applications.update(editingId, {
+          ...formData,
+        });
+      } else {
+        // Create new
+        const newApp: JobApplication = {
+          ...formData,
+          appliedDate,
+          coolOffEnds,
+        };
+        await db.applications.add(newApp);
+      }
+
+      resetForm();
+
+      // Reload data
+      loadApplications(currentPage);
+      loadStats();
+    } catch (error) {
+      console.error('Error saving application:', error);
+      alert('Failed to save application');
+    }
   };
 
   const resetForm = () => {
@@ -117,32 +180,40 @@ export default function Home() {
       status: app.status,
       coolOffStartType: app.coolOffStartType,
     });
-    setEditingId(app.id);
+    setEditingId(app.id!);
     setIsDialogOpen(true);
   };
 
-  const handleDelete = (id: string) => {
+  const handleDelete = async (id: number) => {
     if (confirm("Are you sure you want to delete this application?")) {
-      setApplications(applications.filter((app) => app.id !== id));
+      try {
+        await db.applications.delete(id);
+        loadApplications(currentPage);
+        loadStats();
+      } catch (error) {
+        console.error('Error deleting application:', error);
+      }
     }
   };
 
-  const handleStatusChange = (id: string, newStatus: ApplicationStatus) => {
-    setApplications(
-      applications.map((app) => {
-        if (app.id === id) {
-          let coolOffEnds = app.coolOffEnds;
+  const handleStatusChange = async (id: number, newStatus: ApplicationStatus) => {
+    try {
+      const app = await db.applications.get(id);
+      if (!app) return;
 
-          // Recalculate cool-off if status changed to Rejected and cool-off starts on rejection
-          if (newStatus === "Rejected" && app.coolOffStartType === "rejection") {
-            coolOffEnds = calculateCoolOffDate(new Date().toISOString().split("T")[0], "rejection");
-          }
+      let coolOffEnds = app.coolOffEnds;
 
-          return { ...app, status: newStatus, coolOffEnds };
-        }
-        return app;
-      })
-    );
+      // Recalculate cool-off if status changed to Rejected and cool-off starts on rejection
+      if (newStatus === "Rejected" && app.coolOffStartType === "rejection") {
+        coolOffEnds = calculateCoolOffDate(new Date().toISOString().split("T")[0], "rejection");
+      }
+
+      await db.applications.update(id, { status: newStatus, coolOffEnds });
+      loadApplications(currentPage);
+      loadStats();
+    } catch (error) {
+      console.error('Error updating status:', error);
+    }
   };
 
   const getDaysRemaining = (coolOffDate: string) => {
@@ -152,6 +223,8 @@ export default function Home() {
     const diffDays = Math.ceil(diffTime / (1000 * 60 * 60 * 24));
     return diffDays;
   };
+
+  const totalPages = Math.ceil(totalCount / ITEMS_PER_PAGE);
 
   return (
     <div className="min-h-screen bg-gradient-to-br from-slate-50 via-blue-50 to-slate-100">
@@ -218,10 +291,10 @@ export default function Home() {
         {/* Stats Cards */}
         <div className="grid grid-cols-1 md:grid-cols-4 gap-6 mb-8">
           {[
-            { label: "Total Applications", value: applications.length, icon: BriefcaseBusinessIcon, color: "blue" },
-            { label: "Interviewing", value: applications.filter(a => a.status === "Interviewing").length, icon: Clock, color: "purple" },
-            { label: "Offers", value: applications.filter(a => a.status === "Offer").length, icon: Calendar, color: "green" },
-            { label: "Active", value: applications.filter(a => getDaysRemaining(a.coolOffEnds) > 0).length, icon: Building2, color: "orange" },
+            { label: "Total Applications", value: stats.total, icon: BriefcaseBusinessIcon, color: "blue" },
+            { label: "Interviewing", value: stats.interviewing, icon: Clock, color: "purple" },
+            { label: "Offers", value: stats.offers, icon: Calendar, color: "green" },
+            { label: "Active Cool-offs", value: stats.activeCoolOffs, icon: Building2, color: "orange" },
           ].map((stat, idx) => (
             <div
               key={stat.label}
@@ -261,7 +334,7 @@ export default function Home() {
                     </td>
                   </tr>
                 ) : (
-                  [...applications].sort((a, b) => new Date(b.appliedDate).getTime() - new Date(a.appliedDate).getTime()).map((app) => {
+                  applications.map((app) => {
                     const daysRemaining = getDaysRemaining(app.coolOffEnds);
                     const isCoolOffActive = daysRemaining > 0;
 
@@ -288,7 +361,7 @@ export default function Home() {
                         <td className="px-6 py-4">
                           <Select
                             value={app.status}
-                            onValueChange={(value: ApplicationStatus) => handleStatusChange(app.id, value)}
+                            onValueChange={(value: ApplicationStatus) => handleStatusChange(app.id!, value)}
                           >
                             <SelectTrigger className="w-[140px]">
                               <SelectValue />
@@ -330,7 +403,7 @@ export default function Home() {
                             <Button
                               variant="ghost"
                               size="icon"
-                              onClick={() => handleDelete(app.id)}
+                              onClick={() => handleDelete(app.id!)}
                             >
                               <Trash2 className="w-4 h-4 text-red-600" />
                             </Button>
@@ -343,6 +416,68 @@ export default function Home() {
               </tbody>
             </table>
           </div>
+
+          {/* Pagination */}
+          {totalPages > 1 && (
+            <div className="bg-white border-t border-slate-200 px-6 py-4">
+              <div className="flex items-center justify-between">
+                <div className="text-sm text-slate-600">
+                  Showing {((currentPage - 1) * ITEMS_PER_PAGE) + 1} to {Math.min(currentPage * ITEMS_PER_PAGE, totalCount)} of {totalCount} applications
+                </div>
+                <div className="flex items-center gap-2">
+                  <Button
+                    variant="outline"
+                    size="sm"
+                    onClick={() => setCurrentPage(prev => Math.max(1, prev - 1))}
+                    disabled={currentPage === 1}
+                  >
+                    <ChevronLeft className="w-4 h-4 mr-1" />
+                    Previous
+                  </Button>
+
+                  <div className="flex items-center gap-1">
+                    {Array.from({ length: totalPages }, (_, i) => i + 1)
+                      .filter(page => {
+                        // Show first page, last page, current page, and pages around current
+                        return page === 1 ||
+                               page === totalPages ||
+                               Math.abs(page - currentPage) <= 1;
+                      })
+                      .map((page, idx, arr) => {
+                        // Add ellipsis if there's a gap
+                        const showEllipsisBefore = idx > 0 && page - arr[idx - 1] > 1;
+
+                        return (
+                          <div key={page} className="flex items-center">
+                            {showEllipsisBefore && (
+                              <span className="px-2 text-slate-400">...</span>
+                            )}
+                            <Button
+                              variant={currentPage === page ? "default" : "outline"}
+                              size="sm"
+                              onClick={() => setCurrentPage(page)}
+                              className="min-w-[40px]"
+                            >
+                              {page}
+                            </Button>
+                          </div>
+                        );
+                      })}
+                  </div>
+
+                  <Button
+                    variant="outline"
+                    size="sm"
+                    onClick={() => setCurrentPage(prev => Math.min(totalPages, prev + 1))}
+                    disabled={currentPage === totalPages}
+                  >
+                    Next
+                    <ChevronRight className="w-4 h-4 ml-1" />
+                  </Button>
+                </div>
+              </div>
+            </div>
+          )}
         </div>
       </div>
 
